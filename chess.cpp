@@ -41,7 +41,8 @@ struct BoardState {
 // Constantes de Jogo e Busca
 const int WK_CASTLE = 1, WQ_CASTLE = 2, BK_CASTLE = 4, BQ_CASTLE = 8; 
 const int PAWN_VALUE = 100, KNIGHT_VALUE = 320, BISHOP_VALUE = 330, ROOK_VALUE = 500, QUEEN_VALUE = 900, KING_VALUE_MATERIAL = 0;
-const int MATE_SCORE = 20000, INFINITE_SCORE = MATE_SCORE * 2, DEFAULT_SEARCH_DEPTH = 7, MAX_QUIESCENCE_PLY = 5; 
+const int MATE_SCORE = 20000, INFINITE_SCORE = MATE_SCORE * 2, DEFAULT_SEARCH_DEPTH = 7, MAX_QUIESCENCE_PLY = 5;
+const int CONTEMPT_FACTOR = 30; // discourages draws when ahead
 
 const Bitboard FILE_A_BB = 0x0101010101010101ULL;
 const Bitboard FILE_B_BB = FILE_A_BB << 1;
@@ -153,17 +154,18 @@ void generate_queen_pseudo_moves(const BoardState &board, std::vector<Move> &mov
 void generate_king_pseudo_moves(const BoardState &board, std::vector<Move> &moveList);
 void generate_sliding_pseudo_moves(const BoardState &board, std::vector<Move> &moveList, PieceType pt, const int directions[], int num_directions);
 void generate_legal_moves(const BoardState &original_board, std::vector<Move> &legalMoveList, bool capturesOnly);
-int evaluate(const BoardState &board); 
-int quiescence_search(BoardState currentBoard, int alpha, int beta, int q_depth); 
-int negamax_search(BoardState currentBoard, int depth, int alpha, int beta); 
-Move find_best_move(const BoardState& board, int searchDepth); 
+int evaluate(const BoardState &board);
+int quiescence_search(BoardState currentBoard, int alpha, int beta, int q_depth);
+int negamax_search(BoardState currentBoard, int depth, int alpha, int beta, std::vector<Bitboard>& history);
+Move find_best_move(const BoardState& board, int searchDepth, const std::vector<Bitboard>& history);
 void initialize_board(BoardState &board);
 void print_pretty_board(const BoardState &board);
 Move parse_move_input(const std::string& moveStr, const std::vector<Move>& legalMoves, Color currentSide);
 void initialize_attack_tables();
 void initialize_evaluation_parameters();
 char piece_to_char(PieceType pt);
-int search_root_move_task(BoardState boardAfterMove, int searchDepth);
+int search_root_move_task(BoardState boardAfterMove, int searchDepth, std::vector<Bitboard> history);
+int count_repetitions(const std::vector<Bitboard>& history, Bitboard key);
 
 
 // --- Implementações Completas das Funções ---
@@ -200,6 +202,10 @@ void clear_transposition_table() {
     for(int i = 0; i < TT_SIZE; ++i) {
         transpositionTable[i] = {0, 0, 0, TT_EXACT};
     }
+}
+
+int count_repetitions(const std::vector<Bitboard>& history, Bitboard key) {
+    return std::count(history.begin(), history.end(), key);
 }
 
 void initialize_zobrist_keys() {
@@ -853,9 +859,13 @@ int quiescence_search(BoardState currentBoard, int alpha, int beta, int q_depth)
 }
 
 
-int negamax_search(BoardState currentBoard, int depth, int alpha, int beta) {
+int negamax_search(BoardState currentBoard, int depth, int alpha, int beta, std::vector<Bitboard>& history) {
     Bitboard key = currentBoard.zobristKey;
     TTEntry& tt_entry = transpositionTable[key & (TT_SIZE - 1)];
+
+    if (count_repetitions(history, key) >= 3) {
+        return -CONTEMPT_FACTOR;
+    }
 
     if (tt_entry.key == key && tt_entry.depth >= depth) {
         if (tt_entry.flag == TT_EXACT) {
@@ -907,7 +917,9 @@ int negamax_search(BoardState currentBoard, int depth, int alpha, int beta) {
         const Move& move = scored_move.move;
         BoardState nextBoard = currentBoard;
         make_move_internal(nextBoard, move);
-        int score = -negamax_search(nextBoard, depth - 1, -beta, -alpha); 
+        history.push_back(nextBoard.zobristKey);
+        int score = -negamax_search(nextBoard, depth - 1, -beta, -alpha, history);
+        history.pop_back();
         
         if (score > maxScore) {
             maxScore = score;
@@ -934,11 +946,12 @@ int negamax_search(BoardState currentBoard, int depth, int alpha, int beta) {
     return maxScore;
 }
 
-int search_root_move_task(BoardState boardAfterMove, int searchDepth) {
-    return -negamax_search(boardAfterMove, searchDepth - 1, -INFINITE_SCORE, INFINITE_SCORE);
+int search_root_move_task(BoardState boardAfterMove, int searchDepth, std::vector<Bitboard> history) {
+    history.push_back(boardAfterMove.zobristKey);
+    return -negamax_search(boardAfterMove, searchDepth - 1, -INFINITE_SCORE, INFINITE_SCORE, history);
 }
 
-Move find_best_move(const BoardState& board, int searchDepth) {
+Move find_best_move(const BoardState& board, int searchDepth, const std::vector<Bitboard>& history) {
     std::vector<Move> legalMoves;
     generate_legal_moves(board, legalMoves, false);
 
@@ -975,8 +988,8 @@ Move find_best_move(const BoardState& board, int searchDepth) {
         const Move& move = scored_move.move;
         BoardState nextBoard = board;
         make_move_internal(nextBoard, move);
-        
-        futures.push_back(std::async(std::launch::async, search_root_move_task, nextBoard, searchDepth));
+        auto historyCopy = history;
+        futures.push_back(std::async(std::launch::async, search_root_move_task, nextBoard, searchDepth, historyCopy));
         moves_in_order.push_back(move);
     }
 
@@ -1017,16 +1030,24 @@ int main() {
     BoardState board;
     initialize_board(board);
 
+    std::vector<Bitboard> positionHistory;
+    positionHistory.push_back(board.zobristKey);
+
     std::string userInput;
-    std::vector<Move> legal_moves_for_player; 
+    std::vector<Move> legal_moves_for_player;
 
     Color playerColor = WHITE;
     int currentSearchDepth = DEFAULT_SEARCH_DEPTH;
 
     while(true) {
+        if (count_repetitions(positionHistory, board.zobristKey) >= 3) {
+            std::cout << "EMPATE por repeticao de posicao!" << std::endl;
+            break;
+        }
+
         print_pretty_board(board);
         std::cout << "Avaliacao Estatica (Brancas): " << evaluate(board) << std::endl;
-        std::cout << "Chave Zobrist: " << board.zobristKey << std::endl; 
+        std::cout << "Chave Zobrist: " << board.zobristKey << std::endl;
 
         if(board.sideToMove == BLACK && board.fullMoveNumber == 1) clear_transposition_table();
 
@@ -1076,14 +1097,15 @@ int main() {
                  continue; 
             }
         } else { 
-            chosenMove = find_best_move(board, currentSearchDepth);
-            if (chosenMove.fromSquare == NO_SQ) { 
+            chosenMove = find_best_move(board, currentSearchDepth, positionHistory);
+            if (chosenMove.fromSquare == NO_SQ) {
                 std::cout << "Motor nao conseguiu encontrar um lance!" << std::endl;
                 break;
             }
         }
-        
+
         make_move_internal(board, chosenMove);
+        positionHistory.push_back(board.zobristKey);
     }
     
     return 0;
