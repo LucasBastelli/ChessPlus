@@ -69,8 +69,9 @@ const Bitboard NOT_AB_FILE = ~(FILE_A_BB | FILE_B_BB);
 
 std::array<int, NUM_BASE_PIECE_TYPES> pieceMaterialValue = { PAWN_VALUE, KNIGHT_VALUE, BISHOP_VALUE, ROOK_VALUE, QUEEN_VALUE, KING_VALUE_MATERIAL };
 std::array<std::array<int, 64>, NUM_BASE_PIECE_TYPES> pieceSquareTables;
+std::array<std::array<int, NUM_BASE_PIECE_TYPES>, NUM_BASE_PIECE_TYPES> mvv_lva;
 std::array<Bitboard, 64> knightAttacks;
-std::array<Bitboard, 64> kingAttacks; 
+std::array<Bitboard, 64> kingAttacks;
 
 // --- Zobrist Hashing e Tabela de Transposição ---
 std::array<std::array<Bitboard, 64>, NUM_PIECE_TYPES> zobristPieceKeys;
@@ -165,6 +166,7 @@ void print_pretty_board(const BoardState &board);
 Move parse_move_input(const std::string& moveStr, const std::vector<Move>& legalMoves, Color currentSide);
 void initialize_attack_tables();
 void initialize_evaluation_parameters();
+void initialize_mvv_lva();
 char piece_to_char(PieceType pt);
 int search_root_move_task(BoardState boardAfterMove, int searchDepth, std::vector<Bitboard> history);
 int count_repetitions(const std::vector<Bitboard>& history, Bitboard key);
@@ -282,12 +284,20 @@ void initialize_evaluation_parameters() {
           0,  0,  5,  5,  5,  5,  0, -5, -10,  5,  5,  5,  5,  5,  0,-10,
         -10,  0,  5,  0,  0,  0,  0,-10, -20,-10,-10, -5, -5,-10,-10,-20
     };
-    pieceSquareTables[WK] = { 
+    pieceSquareTables[WK] = {
         -30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30,
         -30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30,
         -20,-30,-30,-40,-40,-30,-30,-20, -10,-20,-20,-20,-20,-20,-20,-10,
          20, 20,  0,  0,  0,  0, 20, 20,  20, 30, 10,  0,  0, 10, 30, 20
     };
+}
+
+void initialize_mvv_lva() {
+    for (int victim = 0; victim < NUM_BASE_PIECE_TYPES; ++victim) {
+        for (int attacker = 0; attacker < NUM_BASE_PIECE_TYPES; ++attacker) {
+            mvv_lva[victim][attacker] = pieceMaterialValue[victim] * 10 - pieceMaterialValue[attacker];
+        }
+    }
 }
 
 void initialize_attack_tables() { 
@@ -543,28 +553,37 @@ void generate_knight_pseudo_moves(const BoardState &board, std::vector<Move> &mo
     }
 }
 void generate_sliding_pseudo_moves(const BoardState &board, std::vector<Move> &moveList, PieceType pt, const int directions[], int num_directions) {
-    Color us = board.sideToMove; Bitboard pieces = board.pieceBitboards[pt];
+    Color us = board.sideToMove;
+    Bitboard pieces = board.pieceBitboards[pt];
     Bitboard friendlyPieces = board.colorBitboards[us];
-    Bitboard enemyPieces = board.colorBitboards[(us == WHITE) ? BLACK : WHITE]; Square fromSq;
+    Bitboard enemyPieces = board.colorBitboards[(us == WHITE) ? BLACK : WHITE];
+    Square fromSq;
     while ((fromSq = pop_lsb(pieces)) != NO_SQ) {
         for (int i = 0; i < num_directions; ++i) {
-            int direction = directions[i]; Square currentSq = fromSq;
+            int direction = directions[i];
+            Square currentSq = fromSq;
             while (true) {
                 int nextSq_idx = currentSq + direction;
-                if (nextSq_idx < 0 || nextSq_idx > 63) break;
-                int current_file = currentSq % 8; int next_file = nextSq_idx % 8;
-                int current_rank = currentSq / 8; int next_rank = nextSq_idx / 8;
-                if (abs(direction) == 1) { if (next_rank != current_rank) break; } 
-                else if (abs(direction) != 8) { if (abs(next_file - current_file) != 1 || abs(next_rank - current_rank) != 1) break;}
+                if (nextSq_idx < 0 || nextSq_idx >= 64) break;
+                if (abs((nextSq_idx % 8) - (currentSq % 8)) > 1) break;
                 Square toSq = static_cast<Square>(nextSq_idx);
-                if (get_bit(friendlyPieces, toSq)) break; 
+                if (get_bit(friendlyPieces, toSq)) break;
                 PieceType captured = NO_PIECE;
-                if (get_bit(enemyPieces, toSq)) { 
-                    if (us == WHITE) { for(int pt_idx = BP; pt_idx <= BK; ++pt_idx) { if(get_bit(board.pieceBitboards[pt_idx], toSq)) { captured = static_cast<PieceType>(pt_idx); break;}}}
-                    else { for(int pt_idx = WP; pt_idx <= WK; ++pt_idx) { if(get_bit(board.pieceBitboards[pt_idx], toSq)) { captured = static_cast<PieceType>(pt_idx); break;}}}
-                    moveList.emplace_back(fromSq, toSq, pt, captured); break; 
+                if (get_bit(enemyPieces, toSq)) {
+                    if (us == WHITE) {
+                        for(int pt_idx = BP; pt_idx <= BK; ++pt_idx) {
+                            if(get_bit(board.pieceBitboards[pt_idx], toSq)) { captured = static_cast<PieceType>(pt_idx); break; }
+                        }
+                    } else {
+                        for(int pt_idx = WP; pt_idx <= WK; ++pt_idx) {
+                            if(get_bit(board.pieceBitboards[pt_idx], toSq)) { captured = static_cast<PieceType>(pt_idx); break; }
+                        }
+                    }
+                    moveList.emplace_back(fromSq, toSq, pt, captured);
+                    break;
                 }
-                moveList.emplace_back(fromSq, toSq, pt); currentSq = toSq; 
+                moveList.emplace_back(fromSq, toSq, pt);
+                currentSq = toSq;
             }
         }
     }
@@ -928,9 +947,11 @@ int quiescence_search(BoardState currentBoard, int alpha, int beta, int q_depth)
     
     std::vector<ScoredMove> scoredCaptureMoves;
     for(const auto& cap_move : captureMoves) {
-        int move_score = 1000; 
+        int move_score = 1000;
         if (cap_move.pieceCaptured != NO_PIECE) {
-             move_score += pieceMaterialValue[cap_move.pieceCaptured % NUM_BASE_PIECE_TYPES] - pieceMaterialValue[cap_move.pieceMoved % NUM_BASE_PIECE_TYPES];
+            int victim = cap_move.pieceCaptured % NUM_BASE_PIECE_TYPES;
+            int aggressor = cap_move.pieceMoved % NUM_BASE_PIECE_TYPES;
+            move_score += mvv_lva[victim][aggressor];
         }
         scoredCaptureMoves.emplace_back(cap_move, move_score);
     }
@@ -993,13 +1014,15 @@ int negamax_search(BoardState currentBoard, int depth, int alpha, int beta, std:
     for(const auto& move : legalMoves) {
         int move_score = 0;
         if (move.isCapture) {
-            move_score = 10000; 
-             if (move.pieceCaptured != NO_PIECE) { 
-                move_score += pieceMaterialValue[move.pieceCaptured % NUM_BASE_PIECE_TYPES] * 10 - pieceMaterialValue[move.pieceMoved % NUM_BASE_PIECE_TYPES];
+            move_score = 10000;
+            if (move.pieceCaptured != NO_PIECE) {
+                int victim = move.pieceCaptured % NUM_BASE_PIECE_TYPES;
+                int aggressor = move.pieceMoved % NUM_BASE_PIECE_TYPES;
+                move_score += mvv_lva[victim][aggressor];
             }
         } else if (move.isPromotion) {
-            if (move.promotedTo == WQ || move.promotedTo == BQ) move_score = 9000; 
-            else move_score = 1000; 
+            if (move.promotedTo == WQ || move.promotedTo == BQ) move_score = 9000;
+            else move_score = 1000;
         }
         scoredMoves.emplace_back(move, move_score);
     }
@@ -1056,11 +1079,13 @@ Move find_best_move(const BoardState& board, int searchDepth, const std::vector<
 
     std::vector<ScoredMove> rootScoredMoves;
      for(const auto& move : legalMoves) {
-        int move_score = 0; 
+        int move_score = 0;
         if (move.isCapture) {
             move_score = 10000;
             if (move.pieceCaptured != NO_PIECE) {
-                 move_score += pieceMaterialValue[move.pieceCaptured % NUM_BASE_PIECE_TYPES] * 10 - pieceMaterialValue[move.pieceMoved % NUM_BASE_PIECE_TYPES];
+                int victim = move.pieceCaptured % NUM_BASE_PIECE_TYPES;
+                int aggressor = move.pieceMoved % NUM_BASE_PIECE_TYPES;
+                move_score += mvv_lva[victim][aggressor];
             }
         } else if (move.isPromotion) {
             if (move.promotedTo == WQ || move.promotedTo == BQ) move_score = 9000;
@@ -1117,10 +1142,11 @@ Move find_best_move(const BoardState& board, int searchDepth, const std::vector<
 
 
 int main() {
-    initialize_zobrist_keys(); 
-    initialize_attack_tables(); 
-    initialize_evaluation_parameters(); 
-    clear_transposition_table(); 
+    initialize_zobrist_keys();
+    initialize_attack_tables();
+    initialize_evaluation_parameters();
+    initialize_mvv_lva();
+    clear_transposition_table();
 
     BoardState board;
     initialize_board(board);
