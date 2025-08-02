@@ -69,8 +69,9 @@ const Bitboard NOT_AB_FILE = ~(FILE_A_BB | FILE_B_BB);
 
 std::array<int, NUM_BASE_PIECE_TYPES> pieceMaterialValue = { PAWN_VALUE, KNIGHT_VALUE, BISHOP_VALUE, ROOK_VALUE, QUEEN_VALUE, KING_VALUE_MATERIAL };
 std::array<std::array<int, 64>, NUM_BASE_PIECE_TYPES> pieceSquareTables;
+std::array<std::array<int, NUM_BASE_PIECE_TYPES>, NUM_BASE_PIECE_TYPES> mvv_lva;
 std::array<Bitboard, 64> knightAttacks;
-std::array<Bitboard, 64> kingAttacks; 
+std::array<Bitboard, 64> kingAttacks;
 
 // --- Zobrist Hashing e Tabela de Transposição ---
 std::array<std::array<Bitboard, 64>, NUM_PIECE_TYPES> zobristPieceKeys;
@@ -154,6 +155,8 @@ void generate_queen_pseudo_moves(const BoardState &board, std::vector<Move> &mov
 void generate_king_pseudo_moves(const BoardState &board, std::vector<Move> &moveList);
 void generate_sliding_pseudo_moves(const BoardState &board, std::vector<Move> &moveList, PieceType pt, const int directions[], int num_directions);
 void generate_legal_moves(const BoardState &original_board, std::vector<Move> &legalMoveList, bool capturesOnly);
+int evaluate_king_safety(const BoardState &board);
+int evaluate_pawn_structure(const BoardState &board);
 int evaluate(const BoardState &board);
 int quiescence_search(BoardState currentBoard, int alpha, int beta, int q_depth);
 int negamax_search(BoardState currentBoard, int depth, int alpha, int beta, std::vector<Bitboard>& history);
@@ -163,6 +166,7 @@ void print_pretty_board(const BoardState &board);
 Move parse_move_input(const std::string& moveStr, const std::vector<Move>& legalMoves, Color currentSide);
 void initialize_attack_tables();
 void initialize_evaluation_parameters();
+void initialize_mvv_lva();
 char piece_to_char(PieceType pt);
 int search_root_move_task(BoardState boardAfterMove, int searchDepth, std::vector<Bitboard> history);
 int count_repetitions(const std::vector<Bitboard>& history, Bitboard key);
@@ -280,12 +284,20 @@ void initialize_evaluation_parameters() {
           0,  0,  5,  5,  5,  5,  0, -5, -10,  5,  5,  5,  5,  5,  0,-10,
         -10,  0,  5,  0,  0,  0,  0,-10, -20,-10,-10, -5, -5,-10,-10,-20
     };
-    pieceSquareTables[WK] = { 
+    pieceSquareTables[WK] = {
         -30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30,
         -30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30,
         -20,-30,-30,-40,-40,-30,-30,-20, -10,-20,-20,-20,-20,-20,-20,-10,
          20, 20,  0,  0,  0,  0, 20, 20,  20, 30, 10,  0,  0, 10, 30, 20
     };
+}
+
+void initialize_mvv_lva() {
+    for (int victim = 0; victim < NUM_BASE_PIECE_TYPES; ++victim) {
+        for (int attacker = 0; attacker < NUM_BASE_PIECE_TYPES; ++attacker) {
+            mvv_lva[victim][attacker] = pieceMaterialValue[victim] * 10 - pieceMaterialValue[attacker];
+        }
+    }
 }
 
 void initialize_attack_tables() { 
@@ -541,28 +553,37 @@ void generate_knight_pseudo_moves(const BoardState &board, std::vector<Move> &mo
     }
 }
 void generate_sliding_pseudo_moves(const BoardState &board, std::vector<Move> &moveList, PieceType pt, const int directions[], int num_directions) {
-    Color us = board.sideToMove; Bitboard pieces = board.pieceBitboards[pt];
+    Color us = board.sideToMove;
+    Bitboard pieces = board.pieceBitboards[pt];
     Bitboard friendlyPieces = board.colorBitboards[us];
-    Bitboard enemyPieces = board.colorBitboards[(us == WHITE) ? BLACK : WHITE]; Square fromSq;
+    Bitboard enemyPieces = board.colorBitboards[(us == WHITE) ? BLACK : WHITE];
+    Square fromSq;
     while ((fromSq = pop_lsb(pieces)) != NO_SQ) {
         for (int i = 0; i < num_directions; ++i) {
-            int direction = directions[i]; Square currentSq = fromSq;
+            int direction = directions[i];
+            Square currentSq = fromSq;
             while (true) {
                 int nextSq_idx = currentSq + direction;
-                if (nextSq_idx < 0 || nextSq_idx > 63) break;
-                int current_file = currentSq % 8; int next_file = nextSq_idx % 8;
-                int current_rank = currentSq / 8; int next_rank = nextSq_idx / 8;
-                if (abs(direction) == 1) { if (next_rank != current_rank) break; } 
-                else if (abs(direction) != 8) { if (abs(next_file - current_file) != 1 || abs(next_rank - current_rank) != 1) break;}
+                if (nextSq_idx < 0 || nextSq_idx >= 64) break;
+                if (abs((nextSq_idx % 8) - (currentSq % 8)) > 1) break;
                 Square toSq = static_cast<Square>(nextSq_idx);
-                if (get_bit(friendlyPieces, toSq)) break; 
+                if (get_bit(friendlyPieces, toSq)) break;
                 PieceType captured = NO_PIECE;
-                if (get_bit(enemyPieces, toSq)) { 
-                    if (us == WHITE) { for(int pt_idx = BP; pt_idx <= BK; ++pt_idx) { if(get_bit(board.pieceBitboards[pt_idx], toSq)) { captured = static_cast<PieceType>(pt_idx); break;}}}
-                    else { for(int pt_idx = WP; pt_idx <= WK; ++pt_idx) { if(get_bit(board.pieceBitboards[pt_idx], toSq)) { captured = static_cast<PieceType>(pt_idx); break;}}}
-                    moveList.emplace_back(fromSq, toSq, pt, captured); break; 
+                if (get_bit(enemyPieces, toSq)) {
+                    if (us == WHITE) {
+                        for(int pt_idx = BP; pt_idx <= BK; ++pt_idx) {
+                            if(get_bit(board.pieceBitboards[pt_idx], toSq)) { captured = static_cast<PieceType>(pt_idx); break; }
+                        }
+                    } else {
+                        for(int pt_idx = WP; pt_idx <= WK; ++pt_idx) {
+                            if(get_bit(board.pieceBitboards[pt_idx], toSq)) { captured = static_cast<PieceType>(pt_idx); break; }
+                        }
+                    }
+                    moveList.emplace_back(fromSq, toSq, pt, captured);
+                    break;
                 }
-                moveList.emplace_back(fromSq, toSq, pt); currentSq = toSq; 
+                moveList.emplace_back(fromSq, toSq, pt);
+                currentSq = toSq;
             }
         }
     }
@@ -777,7 +798,98 @@ void generate_legal_moves(const BoardState &original_board, std::vector<Move> &l
     }
 }
 
-int evaluate(const BoardState &board) { 
+int evaluate_king_safety(const BoardState &board) {
+    const int SHIELD_PENALTY = 20;
+    int score = 0;
+
+    int wKingIdx = get_lsb_index(board.pieceBitboards[WK]);
+    if (wKingIdx != -1) {
+        Square wKingSq = static_cast<Square>(wKingIdx);
+        int shield = 0;
+        if (static_cast<int>(wKingSq) <= 55) {
+            if ((static_cast<int>(wKingSq) % 8) != 0 && get_bit(board.pieceBitboards[WP], static_cast<Square>(wKingSq + 7))) shield++;
+            if (get_bit(board.pieceBitboards[WP], static_cast<Square>(wKingSq + 8))) shield++;
+            if ((static_cast<int>(wKingSq) % 8) != 7 && get_bit(board.pieceBitboards[WP], static_cast<Square>(wKingSq + 9))) shield++;
+        }
+        score -= (3 - shield) * SHIELD_PENALTY;
+    }
+
+    int bKingIdx = get_lsb_index(board.pieceBitboards[BK]);
+    if (bKingIdx != -1) {
+        Square bKingSq = static_cast<Square>(bKingIdx);
+        int shield = 0;
+        if (static_cast<int>(bKingSq) >= 8) {
+            if ((static_cast<int>(bKingSq) % 8) != 7 && get_bit(board.pieceBitboards[BP], static_cast<Square>(bKingSq - 7))) shield++;
+            if (get_bit(board.pieceBitboards[BP], static_cast<Square>(bKingSq - 8))) shield++;
+            if ((static_cast<int>(bKingSq) % 8) != 0 && get_bit(board.pieceBitboards[BP], static_cast<Square>(bKingSq - 9))) shield++;
+        }
+        score += (3 - shield) * SHIELD_PENALTY;
+    }
+
+    return score;
+}
+
+int evaluate_pawn_structure(const BoardState &board) {
+    const int DOUBLED_PENALTY = 20;
+    const int ISOLATED_PENALTY = 15;
+    const int PASSED_BONUS[8] = {0,10,20,30,50,80,130,0};
+
+    int score = 0;
+    Bitboard whitePawns = board.pieceBitboards[WP];
+    Bitboard blackPawns = board.pieceBitboards[BP];
+    std::array<Bitboard,8> fileMasks = {FILE_A_BB,FILE_B_BB,FILE_C_BB,FILE_D_BB,FILE_E_BB,FILE_F_BB,FILE_G_BB,FILE_H_BB};
+
+    for (int file = 0; file < 8; ++file) {
+        Bitboard mask = fileMasks[file];
+        int wCount = countSetBits(whitePawns & mask);
+        int bCount = countSetBits(blackPawns & mask);
+        if (wCount > 1) score -= (wCount - 1) * DOUBLED_PENALTY;
+        if (bCount > 1) score += (bCount - 1) * DOUBLED_PENALTY;
+
+        if (wCount > 0) {
+            bool left = file > 0 && (whitePawns & fileMasks[file-1]);
+            bool right = file < 7 && (whitePawns & fileMasks[file+1]);
+            if (!left && !right) score -= ISOLATED_PENALTY * wCount;
+        }
+        if (bCount > 0) {
+            bool left = file > 0 && (blackPawns & fileMasks[file-1]);
+            bool right = file < 7 && (blackPawns & fileMasks[file+1]);
+            if (!left && !right) score += ISOLATED_PENALTY * bCount;
+        }
+    }
+
+    Bitboard wp = whitePawns; Square sq;
+    while ((sq = pop_lsb(wp)) != NO_SQ) {
+        int idx = static_cast<int>(sq);
+        int file = idx % 8;
+        int rank = idx / 8;
+        bool blocked = false;
+        for (int r = rank + 1; r < 8 && !blocked; ++r) {
+            if (get_bit(blackPawns, static_cast<Square>(r*8 + file))) blocked = true;
+            if (file > 0 && get_bit(blackPawns, static_cast<Square>(r*8 + file - 1))) blocked = true;
+            if (file < 7 && get_bit(blackPawns, static_cast<Square>(r*8 + file + 1))) blocked = true;
+        }
+        if (!blocked) score += PASSED_BONUS[rank];
+    }
+
+    Bitboard bp = blackPawns;
+    while ((sq = pop_lsb(bp)) != NO_SQ) {
+        int idx = static_cast<int>(sq);
+        int file = idx % 8;
+        int rank = idx / 8;
+        bool blocked = false;
+        for (int r = rank - 1; r >= 0 && !blocked; --r) {
+            if (get_bit(whitePawns, static_cast<Square>(r*8 + file))) blocked = true;
+            if (file > 0 && get_bit(whitePawns, static_cast<Square>(r*8 + file - 1))) blocked = true;
+            if (file < 7 && get_bit(whitePawns, static_cast<Square>(r*8 + file + 1))) blocked = true;
+        }
+        if (!blocked) score -= PASSED_BONUS[7 - rank];
+    }
+
+    return score;
+}
+
+int evaluate(const BoardState &board) {
     int score = 0;
     int materialScore = 0;
     int pstScore = 0;
@@ -804,7 +916,9 @@ int evaluate(const BoardState &board) {
         }
     }
     score = materialScore + pstScore;
-    return score; 
+    score += evaluate_king_safety(board);
+    score += evaluate_pawn_structure(board);
+    return score;
 }
 
 
@@ -833,9 +947,11 @@ int quiescence_search(BoardState currentBoard, int alpha, int beta, int q_depth)
     
     std::vector<ScoredMove> scoredCaptureMoves;
     for(const auto& cap_move : captureMoves) {
-        int move_score = 1000; 
+        int move_score = 1000;
         if (cap_move.pieceCaptured != NO_PIECE) {
-             move_score += pieceMaterialValue[cap_move.pieceCaptured % NUM_BASE_PIECE_TYPES] - pieceMaterialValue[cap_move.pieceMoved % NUM_BASE_PIECE_TYPES];
+            int victim = cap_move.pieceCaptured % NUM_BASE_PIECE_TYPES;
+            int aggressor = cap_move.pieceMoved % NUM_BASE_PIECE_TYPES;
+            move_score += mvv_lva[victim][aggressor];
         }
         scoredCaptureMoves.emplace_back(cap_move, move_score);
     }
@@ -898,13 +1014,15 @@ int negamax_search(BoardState currentBoard, int depth, int alpha, int beta, std:
     for(const auto& move : legalMoves) {
         int move_score = 0;
         if (move.isCapture) {
-            move_score = 10000; 
-             if (move.pieceCaptured != NO_PIECE) { 
-                move_score += pieceMaterialValue[move.pieceCaptured % NUM_BASE_PIECE_TYPES] * 10 - pieceMaterialValue[move.pieceMoved % NUM_BASE_PIECE_TYPES];
+            move_score = 10000;
+            if (move.pieceCaptured != NO_PIECE) {
+                int victim = move.pieceCaptured % NUM_BASE_PIECE_TYPES;
+                int aggressor = move.pieceMoved % NUM_BASE_PIECE_TYPES;
+                move_score += mvv_lva[victim][aggressor];
             }
         } else if (move.isPromotion) {
-            if (move.promotedTo == WQ || move.promotedTo == BQ) move_score = 9000; 
-            else move_score = 1000; 
+            if (move.promotedTo == WQ || move.promotedTo == BQ) move_score = 9000;
+            else move_score = 1000;
         }
         scoredMoves.emplace_back(move, move_score);
     }
@@ -961,11 +1079,13 @@ Move find_best_move(const BoardState& board, int searchDepth, const std::vector<
 
     std::vector<ScoredMove> rootScoredMoves;
      for(const auto& move : legalMoves) {
-        int move_score = 0; 
+        int move_score = 0;
         if (move.isCapture) {
             move_score = 10000;
             if (move.pieceCaptured != NO_PIECE) {
-                 move_score += pieceMaterialValue[move.pieceCaptured % NUM_BASE_PIECE_TYPES] * 10 - pieceMaterialValue[move.pieceMoved % NUM_BASE_PIECE_TYPES];
+                int victim = move.pieceCaptured % NUM_BASE_PIECE_TYPES;
+                int aggressor = move.pieceMoved % NUM_BASE_PIECE_TYPES;
+                move_score += mvv_lva[victim][aggressor];
             }
         } else if (move.isPromotion) {
             if (move.promotedTo == WQ || move.promotedTo == BQ) move_score = 9000;
@@ -1022,10 +1142,11 @@ Move find_best_move(const BoardState& board, int searchDepth, const std::vector<
 
 
 int main() {
-    initialize_zobrist_keys(); 
-    initialize_attack_tables(); 
-    initialize_evaluation_parameters(); 
-    clear_transposition_table(); 
+    initialize_zobrist_keys();
+    initialize_attack_tables();
+    initialize_evaluation_parameters();
+    initialize_mvv_lva();
+    clear_transposition_table();
 
     BoardState board;
     initialize_board(board);
